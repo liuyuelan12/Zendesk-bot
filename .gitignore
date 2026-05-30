@@ -1,3 +1,5 @@
 node_modules/
 .env
 .DS_Store
+state.json
+截图/

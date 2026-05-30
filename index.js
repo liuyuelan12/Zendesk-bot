@@ -2,10 +2,31 @@ require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const zendesk = require('node-zendesk');
 const express = require('express');
+const state = require('./state');
+const { startPolling } = require('./poller');
 const app = express();
+
+// 启动时校验必需的环境变量，缺哪个就明确报哪个，避免后续抛出难懂的底层错误。
+const REQUIRED_ENV = ['TELEGRAM_BOT_TOKEN', 'ZENDESK_EMAIL', 'ZENDESK_TOKEN', 'ZENDESK_SUBDOMAIN'];
+const missingEnv = REQUIRED_ENV.filter((key) => !process.env[key]);
+if (missingEnv.length > 0) {
+  console.error('❌ 缺少必需的环境变量：' + missingEnv.join(', '));
+  console.error('请在 .env 中填写后再启动（参考 README.md）。');
+  process.exit(1);
+}
+
+// /close 时写回的「问题类型」自定义字段 ID。绑定具体 Zendesk 实例，抽到 env；未配置则跳过该字段。
+const QTYPE_FIELD_ID = process.env.ZENDESK_QTYPE_FIELD_ID
+  ? Number(process.env.ZENDESK_QTYPE_FIELD_ID)
+  : null;
 
 // Initialize Telegram Bot
 const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: true });
+
+// 处理轮询错误（双实例 / token 错误会刷 409 Conflict），否则会静默吞掉。
+bot.on('polling_error', (error) => {
+  console.error('Polling error:', error.code, error.message);
+});
 
 // Initialize Zendesk Client
 const zendeskClient = zendesk.createClient({
@@ -14,8 +35,16 @@ const zendeskClient = zendesk.createClient({
   remoteUri: `https://${process.env.ZENDESK_SUBDOMAIN}.zendesk.com/api/v2`
 });
 
-// Store user conversations
-const userConversations = new Map();
+// 从磁盘恢复正在进行的会话（chatId ↔ ticket / requester）。
+state.loadState();
+
+// 启动轮询回传：定时把客服在工单里的新公开回复转发给对应 Telegram 用户。
+startPolling({
+  bot,
+  zendeskClient,
+  state,
+  intervalMs: Number(process.env.POLL_INTERVAL_MS) || 8000,
+});
 
 // Express middleware
 app.use(express.json());
@@ -39,7 +68,7 @@ bot.onText(/\/ticket/i, async (msg) => {
   if (msg.chat.type !== 'private') return;
 
   // Check if user already has an active ticket
-  if (userConversations.has(chatId)) {
+  if (state.getTicketId(chatId)) {
     bot.sendMessage(chatId, 'You already have an active ticket. Please close it with /close before creating a new one.');
     return;
   }
@@ -90,10 +119,9 @@ bot.onText(/\/ticket/i, async (msg) => {
     // Get the requester ID from the created ticket
     const requesterId = ticket.requester_id;
 
-    // Store both ticket ID and requester ID
-    userConversations.set(chatId, ticket.id);
-    userConversations.set(`${chatId}_user_id`, requesterId);
-    bot.sendMessage(chatId, 
+    // Store both ticket ID and requester ID（落盘，重启不丢）
+    state.setConversation(chatId, ticket.id, requesterId);
+    bot.sendMessage(chatId,
       `Support ticket #${ticket.id} has been created. Our team will assist you shortly.\n\n` +
       'You can send messages here and they will be added to your support ticket.\n' +
       'To close your current ticket, simply send /close command.'
@@ -112,7 +140,7 @@ bot.onText(/\/close/i, async (msg) => {
   const chatId = msg.chat.id;
   // 只在私聊中响应
   if (msg.chat.type !== 'private') return;
-  const ticketId = userConversations.get(chatId);
+  const ticketId = state.getTicketId(chatId);
 
   if (ticketId) {
     try {
@@ -143,7 +171,7 @@ bot.onText(/\/close/i, async (msg) => {
 // Handle close ticket callback
 bot.on('callback_query', async (callbackQuery) => {
   const chatId = callbackQuery.message.chat.id;
-  const ticketId = userConversations.get(chatId);
+  const ticketId = state.getTicketId(chatId);
   const data = callbackQuery.data;
 
   if (data.startsWith('close_') && ticketId) {
@@ -165,26 +193,25 @@ bot.on('callback_query', async (callbackQuery) => {
       }[questionTypeTag];
 
       // Update ticket with question type and solve it
-      await zendeskClient.tickets.update(ticketId, {
+      const updatePayload = {
         ticket: {
           status: 'solved',
-          custom_fields: [
-            {
-              id: 6742685813785,
-              value: questionTypeTag
-            }
-          ],
           comment: {
             body: `User closed the conversation (Type: ${questionTypeDisplay})`,
             public: false,
-            author_id: userConversations.get(`${chatId}_user_id`)
+            author_id: state.getUserId(chatId)
           }
         }
-      });
+      };
+      // 仅当配置了字段 ID 时才写「问题类型」，避免在没有该字段的实例上报错。
+      if (QTYPE_FIELD_ID) {
+        updatePayload.ticket.custom_fields = [{ id: QTYPE_FIELD_ID, value: questionTypeTag }];
+      }
+      await zendeskClient.tickets.update(ticketId, updatePayload);
 
       // Answer callback query and send success message
       await bot.answerCallbackQuery(callbackQuery.id);
-      userConversations.delete(chatId);
+      state.clearConversation(chatId);
       bot.sendMessage(chatId, 
         'Your support ticket has been closed. 🎉\n\n' +
         'If you need help again, just send /start to create a new ticket.'
@@ -213,16 +240,20 @@ bot.on('message', async (msg) => {
   if (msg.chat.type !== 'private') return;
   const chatId = msg.chat.id;
   const messageText = msg.text;
-  const userDisplayName = msg.from.username || msg.from.first_name || `User_${msg.from.id}`;
+
+  // 非文本消息（图片/贴纸/文件等）没有 text，直接忽略，避免把 undefined 写进工单。
+  if (!messageText) {
+    return;
+  }
 
   // Ignore commands
-  if (messageText && messageText.startsWith('/')) {
+  if (messageText.startsWith('/')) {
     return;
   }
 
   try {
     // Check if there's an existing ticket for this user
-    const ticketId = userConversations.get(chatId);
+    const ticketId = state.getTicketId(chatId);
 
     if (!ticketId) {
       bot.sendMessage(chatId, 'Please use /ticket to create a new support ticket first.');
@@ -233,7 +264,7 @@ bot.on('message', async (msg) => {
           comment: {
             body: messageText,
             public: true,
-            author_id: userConversations.get(`${chatId}_user_id`),  // Use the user's ID
+            author_id: state.getUserId(chatId),  // Use the user's ID
             type: 'Comment',  // Specify this is a regular comment
             via: { channel: 'telegram' }  // Mark the source as telegram
           }
@@ -247,51 +278,14 @@ bot.on('message', async (msg) => {
   }
 });
 
-// Webhook endpoint for Zendesk
-app.post('/webhook', async (req, res) => {
-  try {
-    // Only process ticket.comment_added events
-    if (req.body.type !== 'zen:event-type:ticket.comment_added') {
-      res.status(200).send('OK');
-      return;
-    }
-
-    const ticketId = req.body.subject.match(/zen:ticket:(\d+)/)?.[1];
-    const comment = req.body.event?.comment;
-
-    // Skip if not a valid comment
-    if (!ticketId || !comment) {
-      res.status(200).send('OK');
-      return;
-    }
-
-    // Only process public comments from staff members
-    // Skip user messages and internal notes
-    if (!comment.is_public || !comment.author?.is_staff) {
-      res.status(200).send('OK');
-      return;
-    }
-
-    // Find the associated chat ID
-    for (const [chatId, savedTicketId] of userConversations.entries()) {
-      if (savedTicketId.toString() === ticketId) {
-        // Send the agent's response to the user with a clear prefix
-        const agentName = comment.author.name || 'Support Team';
-        await bot.sendMessage(chatId, `👤 Support Agent (${agentName}):\n${comment.body}`);
-        break;
-      }
-    }
-    
-    res.status(200).send('OK');
-  } catch (error) {
-    console.error('Webhook Error:', error);
-    res.status(500).send('Error processing webhook');
-  }
+// 健康检查端点（Render 等平台的 web 服务需要进程绑定一个端口）。
+// 客服回复的回传走轮询（见 poller.js），不再需要 webhook 入口。
+app.get('/', (req, res) => {
+  res.status(200).send('OK');
 });
 
 // Start the server
 const PORT = process.env.PORT || 8000;
 app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
-  console.log(`Webhook URL: ${process.env.WEBHOOK_URL}`);
 });
