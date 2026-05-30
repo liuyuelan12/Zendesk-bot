@@ -28,6 +28,24 @@ bot.on('polling_error', (error) => {
   console.error('Polling error:', error.code, error.message);
 });
 
+// 优雅退出：平台（Railway/Render 等）重新部署时先 SIGTERM。
+// 收到后立刻停止 Telegram 轮询并退出，让旧实例尽快释放 getUpdates 连接，
+// 避免新旧实例重叠期间互相 409 Conflict。
+let shuttingDown = false;
+async function gracefulShutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`Received ${signal}, stopping polling and exiting...`);
+  try {
+    await bot.stopPolling({ cancel: true });
+  } catch (error) {
+    console.error('Error while stopping polling:', error.message);
+  }
+  process.exit(0);
+}
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
 // Initialize Zendesk Client
 const zendeskClient = zendesk.createClient({
   username: process.env.ZENDESK_EMAIL,
